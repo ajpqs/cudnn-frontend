@@ -35,6 +35,9 @@ Barriers:
   NamedBarrier(3): compute_sync (256 threads: WG0+WG1)
   NamedBarrier(4): wg_sched_0  (ping-pong: WG0 syncs on this, WG1 arrives)
   NamedBarrier(5): wg_sched_1  (ping-pong: WG1 syncs on this, WG0 arrives)
+  NamedBarrier(6): dk_staging_wg0 (128 threads: orders WG0's sdK_staging stores
+                   against WG0 threads' async bulk-reduce reads of the staging tile)
+  NamedBarrier(7): dk_staging_wg1 (same, for WG1's half)
 
 SMEM (kernel 2): sGradSignal[topk] holds precomputed grad_signal from kernel 1.
 Grid: (seqlen, batch, 1). Each CTA handles one query position.
@@ -166,6 +169,10 @@ class IndexerBackwardSm90:
         # Ping-pong scheduler barriers (WG0 syncs on 4, WG1 syncs on 5)
         self.SCHED_BARRIER_WG0 = 4
         self.SCHED_BARRIER_WG1 = 5
+
+        # Per-WG dK-staging barriers (WG0 on 6, WG1 on 7)
+        self.DK_STAGING_BARRIER_WG0 = 6
+        self.DK_STAGING_BARRIER_WG1 = 7
 
     @cute.jit
     def _dense_num_k_blocks(self, q_token, seqlen_q, seqlen_k, q_causal_offset):
@@ -951,6 +958,17 @@ class IndexerBackwardSm90:
             # reading sdK_staging before we overwrite it (both WGs do their own reduce)
             cute.arch.cp_async_bulk_wait_group(0, read=True)
 
+            if compute_wg_idx == 0:
+                cute.arch.barrier(
+                    barrier_id=self.DK_STAGING_BARRIER_WG0,
+                    number_of_threads=self.WARPGROUP_SIZE,
+                )
+            else:
+                cute.arch.barrier(
+                    barrier_id=self.DK_STAGING_BARRIER_WG1,
+                    number_of_threads=self.WARPGROUP_SIZE,
+                )
+
             # Stage acc_dK × sm_scale to SMEM via partition (no cute.get needed)
             for ei in cutlass.range(0, cute.size(acc_dK), unroll=64):
                 tCsDK_staging[ei] = acc_dK[ei] * Float32(sm_scale)
@@ -958,6 +976,17 @@ class IndexerBackwardSm90:
             warpgroup.wait_group(0)  # GEMM3 done — sK no longer needed
 
             cute.arch.fence_view_async_shared()
+
+            if compute_wg_idx == 0:
+                cute.arch.barrier(
+                    barrier_id=self.DK_STAGING_BARRIER_WG0,
+                    number_of_threads=self.WARPGROUP_SIZE,
+                )
+            else:
+                cute.arch.barrier(
+                    barrier_id=self.DK_STAGING_BARRIER_WG1,
+                    number_of_threads=self.WARPGROUP_SIZE,
+                )
 
             # Per-WG dK bulk reduce: each WG handles its D/2 half independently
             my_ni = wg_tidx
