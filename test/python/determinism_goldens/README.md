@@ -5449,7 +5449,21 @@ python -m pytest deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py 
   -m L0 -q -rs
 ```
 
-The CUDA 12 compiler flavor was unavailable and remains unverified.
+On 2026-11-24, racecheck on an H100 (CUDA 12.9, CuTe DSL 4.8.0) caught the
+loader overwriting `sIndices` during the dK scatter on `eabae084`. Both H32
+top-k 512 replay cases and the H64 top-k 2048 deterministic FP32 case failed.
+On `e7a92d9`, all four cases passed with zero hazards.
+
+Run from `test/python` with `CUDNN_DETERMINISM_GOLDENS` set to the directory
+used to [record the H32 goldens](#golden-checks) on the uninstrumented parent.
+
+```bash
+suite=deepseek_sparse_attention/cutedsl/test_DSA_indexer_backward.py
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUTE_DSL_LINEINFO=1 \
+  compute-sanitizer --tool racecheck --error-exitcode 86 --print-limit 16 \
+  python -m pytest "$suite::test_sm90_deterministic_h32_topk512" \
+    "$suite::test_sm90_indexer_backward_dk_destination_rows" -m L0 -q -rs
+```
 
 ### 2026-11-09: native SM107 per-tensor FP8 paged D512
 

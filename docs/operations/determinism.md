@@ -671,6 +671,9 @@ for replay, batch-invariance, and stress-test results.
   conflict-rank storage, which accept duplicate indices: BF16 H128 two-CTA
   plans and generic plans for which `deterministic_dkv_mode` selects records
   or the chain relay.
+  With 32 heads on SM90, sparse indexer backward reproduces BF16 and FP32 dK
+  for a fixed batch layout. Reordering query rows can change which dK plane
+  accumulates each row. See the [Hopper replay tests](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#hopper-compact-h32-sparse-indexer-backward).
 - On SM90, the default `deterministic_dkv_mode='records'` uses four
   conflict-rank planes and fixed-order plane-zero overflow tickets. A resident
   128-CTA wave pipelines independent dKV column groups; the two-launch schedule

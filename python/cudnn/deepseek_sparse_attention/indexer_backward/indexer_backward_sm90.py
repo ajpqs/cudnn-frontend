@@ -41,6 +41,7 @@ Barriers:
   CTA barrier(3): compute_sync (256 threads: WG0+WG1)
   CTA barrier(4): wg_sched_0  (ping-pong: WG0 syncs on this, WG1 arrives)
   CTA barrier(5): wg_sched_1  (ping-pong: WG1 syncs on this, WG0 arrives)
+  CTA barriers(6, 7): per-WG dK staging and sparse dK scatters before K_CONSUMED
 
 SMEM (kernel 2): sGradSignal[topk] holds precomputed grad_signal from kernel 1.
 Ordinary grid: (seqlen, batch, 1). Deterministic launches bounded
@@ -1159,7 +1160,10 @@ class IndexerBackwardSm90:
                     )
             cute.arch.cp_async_bulk_commit_group()
 
-            # Signal K_CONSUMED: sK can be reused by K-load WG
+            # All warps must issue their dK scatters before thread 0 releases sIndices to the loader.
+            if const_expr(not self.is_dense):
+                nvvm.barrier_cta_sync(dk_staging_barrier_id, thread_count=self.WARPGROUP_SIZE)
+
             if wg_tidx == 0:
                 if stage == 0:
                     cute.arch.mbarrier_arrive(mbar + MBAR_K_CONSUMED_0)

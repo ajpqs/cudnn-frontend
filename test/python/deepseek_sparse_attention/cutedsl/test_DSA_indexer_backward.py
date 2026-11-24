@@ -12,7 +12,7 @@ import inspect
 from test_utils import assert_bitwise_runs, torch_fork_set_rng
 
 from cudnn.api_base import ws_align
-from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm100
+from deepseek_sparse_attention.cutedsl.dsa_utils import dsa_init, with_dsa_indexer_backward_params, _require_sm90, _require_sm100
 from deepseek_sparse_attention.cutedsl.dsa_reference import (
     _indexer_predict_distribution,
     check_ref_indexer_backward,
@@ -952,6 +952,86 @@ def test_sm90_deterministic_h32_topk512(dk_dtype):
     backward_reference(inputs, actual, "sparse")
     assert_golden(f"dsa-indexer-sm90-h32-topk512-{str(dk_dtype).removeprefix('torch.')}", inputs, actual)
     check_batch(samples, run)
+
+
+def _sm90_dk_destination_case(s_q, dk_dtype, *, deterministic=False):
+    from warm_stress import StressCase
+
+    _require_sm90()
+    DSA = _import_dsa()
+    s_kv, topk, block_I = 4096, 2048, 128
+    index_q = torch.ones((1, s_q, 64, 128), dtype=torch.bfloat16, device="cuda")
+    index_k = index_q.new_ones((1, s_kv, 128))
+    weights = torch.zeros_like(index_q[..., 0])
+    weights[..., 0] = 1
+    key_ids = torch.randperm(s_kv, device=index_q.device)[:topk]
+    topk_indices = key_ids.int().expand(1, s_q, topk).contiguous()
+
+    # Only head 0 contributes, so each selected key gets index_score - target.
+    # Tiles i and i + 3 reuse the same index buffer. Exactly one has nonzero dK.
+    dk_by_slot = torch.zeros((topk // block_I, block_I), dtype=torch.float32, device=index_q.device)
+    dk_by_slot[::2, ::2] = -0.5 / topk
+    dk_by_slot[::2, 1::2] = 0.5 / topk
+    dk_by_slot = dk_by_slot.flatten()
+    index_score = torch.full((1, s_q, topk), 1.0 / topk, dtype=torch.float32, device=index_q.device)
+    target = index_score - dk_by_slot
+    attn_score = torch.empty_like(target)
+    grad_loss = index_score.new_ones(())
+
+    expected = {
+        "d_index_q": torch.zeros_like(index_q),
+        "d_weights": torch.zeros_like(weights),
+        "d_index_k": torch.zeros_like(index_k, dtype=dk_dtype),
+    }
+    expected["d_index_k"][0, key_ids] = dk_by_slot[:, None].to(dk_dtype)
+    grads = {name: torch.empty_like(value) for name, value in expected.items()}
+
+    def launch():
+        attn_score.copy_(target)
+        DSA.indexer_backward_wrapper(
+            index_q,
+            weights,
+            index_k,
+            attn_score,
+            index_score,
+            topk_indices,
+            grad_loss,
+            block_I=block_I,
+            deterministic=deterministic,
+            **grads,
+        )
+
+    return StressCase(
+        name="SM90 indexer backward dK destination rows",
+        launch=launch,
+        outputs={**grads, "attn_score": attn_score},
+        reference={**expected, "attn_score": (index_score - target) / s_q},
+        thread_blocks=s_q,
+        refills_per_launch=topk // block_I - 3,
+    )
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "deterministic,dk_dtype",
+    [(False, torch.bfloat16), (True, torch.float32)],
+    ids=["ordinary-bf16-dk", "deterministic-fp32-dk"],
+)
+@torch_fork_set_rng(seed=77)
+def test_sm90_indexer_backward_dk_destination_rows(deterministic, dk_dtype):
+    case = _sm90_dk_destination_case(2, dk_dtype, deterministic=deterministic)
+    case.launch()
+    torch.testing.assert_close(case.outputs, case.reference, rtol=0, atol=0)
+
+
+@pytest.mark.L0
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@torch_fork_set_rng(seed=77)
+def test_sm90_indexer_backward_dk_destination_rows_warm_refill():
+    from warm_stress import assert_warm_stress
+
+    assert_warm_stress(_sm90_dk_destination_case(512, torch.float32))
 
 
 @pytest.mark.gpu_exclusive
